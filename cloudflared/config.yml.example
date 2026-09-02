@@ -1,0 +1,49 @@
+# Tunnel config template. Copy to config.yml and fill in your own values —
+# the real file is gitignored, because the tunnel id and your hostnames are
+# deployment identity rather than source.
+#
+#   cp cloudflared/config.yml.example cloudflared/config.yml
+#
+# Same tunnel UUID as the one that used to run on the samo box, so the DNS
+# records and the Cloudflare dashboard need no changes at all — only the machine
+# running the connector moves.
+#
+# The credentials JSON referenced below is NOT in git. deploy.sh pipes it
+# straight from the samo box to the cloud server; it never lands on a laptop.
+
+tunnel: 00000000-0000-0000-0000-000000000000
+credentials-file: /etc/cloudflared/00000000-0000-0000-0000-000000000000.json
+
+ingress:
+  # samo: straight to samo-proxy over the compose bridge network.
+  #
+  # Plain HTTP is correct here and is not a downgrade. This hop is
+  # container-to-container inside one Docker network on one host — it never
+  # touches the LAN, let alone the internet, so there is no wire for anyone to
+  # sit on. What the browser sees is Cloudflare's own publicly-trusted
+  # certificate, terminated at the edge, and nothing in this file affects that.
+  #
+  # It is also strictly less exposed than what it replaces: the old route went
+  # through nginx over TLS that the tunnel then declined to verify
+  # (noTLSVerify), which is encryption without authentication.
+  - hostname: samo.example.com
+    service: http://samo-proxy:6767
+
+  # tv (Jellyfin): still served by nginx on the samo box, reached across the
+  # LAN. This is the one hop that crosses a real network, so it gets real TLS.
+  #
+  # originServerName rather than noTLSVerify is the whole point. Connecting to
+  # a bare IP would fail hostname verification, so cloudflared is told which
+  # name to use for SNI and for validating the certificate. nginx serves both
+  # vhosts from the same Let's Encrypt certificate (CN=samo.example.com,
+  # and that is its only SAN), so this name is the one that verifies — the
+  # Host header still selects the tv vhost on the far side.
+  #
+  # The upshot: this hop goes from encrypted-but-unauthenticated to genuinely
+  # authenticated against the public Let's Encrypt chain.
+  - hostname: tv.example.com
+    service: https://192.168.1.10:443
+    originRequest:
+      originServerName: samo.example.com
+
+  - service: http_status:404

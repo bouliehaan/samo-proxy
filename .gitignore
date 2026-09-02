@@ -1,0 +1,19 @@
+# Tunnel token and any per-host overrides. Never commit these.
+.env
+
+# Build output
+/samo-proxy
+/out
+/dist
+
+# Local cache when running outside Docker
+/cache
+*.tgz
+
+# Tunnel credentials. deploy.sh moves these machine-to-machine; they must never
+# be committed, and never travel inside the source bundle.
+cloudflared/*.json
+
+# Your own tunnel config: the tunnel id and hostnames are deployment identity,
+# not source. Copy cloudflared/config.yml.example and fill it in.
+cloudflared/config.yml

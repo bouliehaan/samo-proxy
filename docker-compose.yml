@@ -1,0 +1,111 @@
+# samo-proxy + cloudflared: the whole internet edge, on a box that is NOT
+# behind the VPN.
+#
+# The point of running these here rather than on the samo box is the samo box's
+# ProtonVPN kill-switch. With `ufw default deny outgoing` and the VPN as the
+# default route, cloudflared's connection to Cloudflare's edge is a tunnel
+# inside a tunnel — it inherits the VPN's congestion, its MTU, and its
+# throughput ceiling. Moving cloudflared to a machine whose default route is the
+# plain WAN removes all of that, and samo-server keeps its kill-switch intact.
+#
+# Nothing here is published to the LAN. cloudflared reaches samo-proxy over the
+# compose network, and samo-proxy is the only thing that talks to samo-server.
+# That is deliberate: samo-proxy believes CF-Connecting-IP from its trusted
+# sources, and the whole point is that only cloudflared is one of them.
+
+services:
+  samo-proxy:
+    build: .
+    container_name: samo-proxy
+    restart: unless-stopped
+    # No `ports:` — nothing outside this compose network needs to reach it.
+    # Publishing it to the LAN would put a spoofable CF-Connecting-IP header in
+    # reach of anything on the network; see SAMOPROXY_TRUST_FORWARDED_FROM.
+    environment:
+      SAMOPROXY_ADDR: "0.0.0.0:6767"
+
+      # samo-server on the LAN. The one setting you must get right.
+      SAMOPROXY_ORIGIN: "${SAMOPROXY_ORIGIN:-http://192.168.1.10:6969}"
+
+      # cloudflared terminates TLS at Cloudflare's edge and forwards plain
+      # HTTP, so samo-server cannot work the real scheme out for itself.
+      # publicURL() builds absolute URLs from this and security_headers.go
+      # gates HSTS on it.
+      SAMOPROXY_FORWARDED_PROTO: "https"
+
+      # Whose CF-Connecting-IP we believe. This is the security-critical knob:
+      # samo-server's login limiter keys its brute-force lockout on that header,
+      # so anything allowed to set it gets an unlimited supply of rate-limit
+      # buckets. Docker's default bridge is a /16; scope this to the compose
+      # network so it means "cloudflared", not "any container on this host".
+      SAMOPROXY_TRUST_FORWARDED_FROM: "${SAMOPROXY_TRUST_FORWARDED_FROM:-172.23.0.0/16}"
+
+      # Lossless in, Opus out. A 24/96 FLAC is ~4.5 Mbps sustained; 128k Opus
+      # is transparent enough for streaming and ~35x smaller.
+      SAMOPROXY_TRANSCODE: "true"
+      SAMOPROXY_TRANSCODE_CODEC: "opus"
+      SAMOPROXY_TRANSCODE_BITRATE: "128"
+      # Lossy sources pass through untouched. Re-encoding a 192k MP3 is an
+      # audible loss for a much smaller saving.
+      SAMOPROXY_TRANSCODE_LOSSY: "false"
+
+      # The Android client never sends a width, so every grid tile pulls the
+      # full embedded cover. 768 is a real rung on samo-server's ladder.
+      SAMOPROXY_IMAGE_DEFAULT_WIDTH: "768"
+
+      SAMOPROXY_CACHE_DIR: "/var/cache/samo-proxy"
+      SAMOPROXY_CACHE_MAX_MB: "${SAMOPROXY_CACHE_MAX_MB:-16384}"
+      SAMOPROXY_LOG_LEVEL: "${SAMOPROXY_LOG_LEVEL:-info}"
+    volumes:
+      # Transcodes survive restarts. Losing this is not data loss — it just
+      # means the next play of each track re-encodes.
+      - transcode-cache:/var/cache/samo-proxy
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: samo-cloudflared
+    restart: unless-stopped
+    # This is a LOCALLY-MANAGED tunnel: a config file plus a credentials JSON,
+    # not a dashboard token. That is what was already running on the samo box,
+    # and reusing it means the tunnel UUID, the DNS records and every public
+    # hostname carry over untouched — only the machine running the connector
+    # moves. A token-based tunnel would have meant recreating all of that.
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    # Run as the host user that owns the credentials file.
+    #
+    # The image defaults to uid 65532, but the credentials arrive from the samo
+    # box as mode 600 owned by the deploying user — so the default user cannot
+    # read them and the container crash-loops on "permission denied". The
+    # alternatives are worse: loosening the file to 644 exposes a secret to
+    # every user on a box that also runs Immich and Nextcloud, and chowning it
+    # to 65532 would need root, which nothing else in this deploy does.
+    #
+    # deploy.sh writes the target's real uid/gid into .env, so this is correct
+    # on a host where the deploying user is not 1000.
+    user: "${CLOUDFLARED_UID:-1000}:${CLOUDFLARED_GID:-1000}"
+    volumes:
+      # Read-only: the connector needs to read its credentials, never write
+      # them. The JSON in here is gitignored and is moved into place by
+      # deploy.sh, straight from the samo box.
+      - ./cloudflared:/etc/cloudflared:ro
+    depends_on:
+      samo-proxy:
+        condition: service_healthy
+
+networks:
+  # Pinned, for the same reason samo-server pins its own: Compose otherwise
+  # auto-assigns the next free /16 from Docker's pool, and that drifts as other
+  # stacks come and go. Here the subnet is load-bearing rather than incidental —
+  # SAMOPROXY_TRUST_FORWARDED_FROM names it, and a drifted subnet would silently
+  # stop trusting cloudflared, which shows up as every client sharing one
+  # rate-limit bucket rather than as an error.
+  #
+  # 172.23 rather than samo-server's 172.22, so the two stacks never collide if
+  # they ever land on the same host.
+  default:
+    ipam:
+      config:
+        - subnet: 172.23.0.0/16
+
+volumes:
+  transcode-cache:
