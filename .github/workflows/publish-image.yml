@@ -67,6 +67,19 @@ jobs:
             #
             # --resolve-image-digests pins the reference inside the artifact to
             # the image built immediately above.
+            # `docker compose publish` needs a recent Compose plugin, and the
+            # runner image's is not guaranteed to be new enough. Install a
+            # pinned one rather than hoping — a release that fails here has
+            # already pushed the image, so the two halves would be out of step.
+            - name: Install a Compose that can publish
+              run: |
+                  mkdir -p ~/.docker/cli-plugins
+                  curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
+                      https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64
+                  chmod +x ~/.docker/cli-plugins/docker-compose
+                  docker compose version
+                  docker compose publish --help >/dev/null
+
             - name: Publish the compose artifact
               run: |
                   docker compose -f docker-compose.yml publish --yes \
