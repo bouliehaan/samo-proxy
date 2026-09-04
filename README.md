@@ -40,10 +40,10 @@ That pulls [`ghcr.io/bouliehaan/samo-proxy:latest`](https://github.com/bouliehaa
 alongside `cloudflare/cloudflared`. The tunnel's credentials JSON goes in
 `cloudflared/` and is gitignored — it is deployment identity, not source.
 
-Deploying from a laptop, and moving an existing tunnel across without recreating
-it, is [docs/DEPLOY.md](docs/DEPLOY.md). That path checks the target is not the
-samo box, that its default route is not itself a VPN, and that it can reach
-samo-server before it ships anything.
+Moving an existing Cloudflare tunnel onto this box rather than making a new one
+is [docs/DEPLOY.md](docs/DEPLOY.md), along with the two checks worth doing
+first: that the box's default route is not itself a VPN, and that it can reach
+samo-server.
 
 Nothing is published to the LAN. cloudflared reaches samo-proxy over the compose
 network, and that is deliberate — see [Trust](#trust).
@@ -122,5 +122,5 @@ when the proxy is not there, are in
   egress door, why none of this needs a certificate, the cache keys, and the
   three slow-link problems that live in the Android client where no proxy can
   reach them.
-- [docs/DEPLOY.md](docs/DEPLOY.md) — `deploy.sh`, moving the tunnel without
-  recreating it, and the cutover order.
+- [docs/DEPLOY.md](docs/DEPLOY.md) — moving an existing Cloudflare tunnel onto
+  the edge box without recreating it, and the cutover order.

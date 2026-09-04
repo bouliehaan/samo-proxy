@@ -16,8 +16,8 @@
 services:
   samo-proxy:
     # Published image, so `docker compose pull` installs without a toolchain.
-    # `build` is the fallback and is what deploy.sh uses (--build) to ship a
-    # working tree that is ahead of the release.
+    # `build` is the fallback, for running a working tree ahead of the release
+    # with `docker compose up -d --build`.
     image: ghcr.io/bouliehaan/samo-proxy:latest
     build: .
     container_name: samo-proxy
@@ -109,13 +109,13 @@ services:
     # every user on a box that also runs Immich and Nextcloud, and chowning it
     # to 65532 would need root, which nothing else in this deploy does.
     #
-    # deploy.sh writes the target's real uid/gid into .env, so this is correct
-    # on a host where the deploying user is not 1000.
+    # Put the real uid/gid in .env (see docs/DEPLOY.md), so this is correct on
+    # a host where the deploying user is not 1000.
     user: "${CLOUDFLARED_UID:-1000}:${CLOUDFLARED_GID:-1000}"
     volumes:
       # Read-only: the connector needs to read its credentials, never write
-      # them. The JSON in here is gitignored and is moved into place by
-      # deploy.sh, straight from the samo box.
+      # them. The JSON in here is gitignored; docs/DEPLOY.md has how to move it
+      # across without it landing on a laptop or in an image layer.
       - ./cloudflared:/etc/cloudflared:ro
     depends_on:
       samo-proxy:

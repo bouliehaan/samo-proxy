@@ -1,8 +1,7 @@
 # Publishes the container image people actually install from.
 #
-# deploy.sh in this repo is maintainer tooling — it ships a working tree over
-# ssh and builds on the target. That is not an install path for anyone else, so
-# a release is not usable until the image below exists.
+# A release is not usable until the image below exists: installing is
+# `docker compose pull`, and there is nothing else to install from.
 #
 # Fires on a version tag. workflow_dispatch is there to (re)build an image for a
 # tag that already exists, which is how v1.0.0 got its first image.

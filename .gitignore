@@ -10,7 +10,7 @@
 /cache
 *.tgz
 
-# Tunnel credentials. deploy.sh moves these machine-to-machine; they must never
+# Tunnel credentials. These move machine-to-machine; they must never
 # be committed, and never travel inside the source bundle.
 cloudflared/*.json
 

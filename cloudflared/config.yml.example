@@ -8,8 +8,9 @@
 # records and the Cloudflare dashboard need no changes at all — only the machine
 # running the connector moves.
 #
-# The credentials JSON referenced below is NOT in git. deploy.sh pipes it
-# straight from the samo box to the cloud server; it never lands on a laptop.
+# The credentials JSON referenced below is NOT in git. docs/DEPLOY.md has how to
+# pipe it straight from the samo box to the edge box, without it ever landing on
+# a laptop.
 
 tunnel: 00000000-0000-0000-0000-000000000000
 credentials-file: /etc/cloudflared/00000000-0000-0000-0000-000000000000.json
