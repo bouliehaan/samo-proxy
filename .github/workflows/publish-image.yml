@@ -101,10 +101,23 @@ jobs:
                   # against Compose's own cache directory, not the directory the
                   # install was run from. It fails silently: the container comes
                   # up with an empty mount instead of your tunnel credentials.
-                  if docker compose -f "$ref" config \
-                       | grep -E '^\s+source: (\./|\.\./|[^/$])' ; then
-                      echo "the published compose has a relative bind mount" >&2
-                      echo "under oci:// that mounts Compose's cache dir, not the user's files" >&2
-                      exit 1
-                  fi
-                  echo "every bind mount is absolute"
+                  #
+                  # Parsed rather than grepped, because a named volume's source
+                  # is a bare name and looks exactly like a relative path.
+                  docker compose -f "$ref" config --format json > /tmp/resolved.json
+                  python3 - <<'CHECK'
+                  import json, sys
+                  services = json.load(open("/tmp/resolved.json"))["services"]
+                  bad = [
+                      f"{name}: {mount.get('source')}"
+                      for name, spec in services.items()
+                      for mount in spec.get("volumes", [])
+                      if mount.get("type") == "bind"
+                      and not str(mount.get("source", "")).startswith("/")
+                  ]
+                  if bad:
+                      print("relative bind mounts in the published artifact:", *bad, sep="\n  ")
+                      print("under oci:// those mount Compose's cache dir, not the user's files")
+                      sys.exit(1)
+                  print("every bind mount is absolute")
+                  CHECK
