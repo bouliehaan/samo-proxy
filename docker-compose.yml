@@ -115,7 +115,13 @@ services:
       # Read-only: the connector needs to read its credentials, never write
       # them. The JSON in here is gitignored; docs/DEPLOY.md has how to move it
       # across without it landing on a laptop or in an image layer.
-      - ./cloudflared:/etc/cloudflared:ro
+      #
+      # An ABSOLUTE path, and it has to stay one. This file is pulled straight
+      # from ghcr with `-f oci://...`, and Compose resolves a relative bind
+      # against its own cache directory rather than your working directory —
+      # so `./cloudflared` would silently mount an empty directory and the
+      # connector would come up with no config and no credentials.
+      - ${SAMOPROXY_TUNNEL_DIR:-/etc/samo-proxy/cloudflared}:/etc/cloudflared:ro
     depends_on:
       samo-proxy:
         condition: service_healthy

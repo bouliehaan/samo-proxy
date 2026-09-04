@@ -89,7 +89,22 @@ jobs:
                       --resolve-image-digests \
                       "ghcr.io/${{ github.repository }}:compose"
 
-            - name: Check the published artifact resolves
+            - name: Check the published artifact resolves and has no relative binds
               run: |
-                  docker compose -f "oci://ghcr.io/${{ github.repository }}:compose" config >/dev/null
-                  echo "oci://ghcr.io/${{ github.repository }}:compose resolves"
+                  set -euo pipefail
+                  ref="oci://ghcr.io/${{ github.repository }}:compose"
+
+                  docker compose -f "$ref" config >/dev/null
+                  echo "$ref resolves"
+
+                  # A relative bind in a file pulled with -f oci:// resolves
+                  # against Compose's own cache directory, not the directory the
+                  # install was run from. It fails silently: the container comes
+                  # up with an empty mount instead of your tunnel credentials.
+                  if docker compose -f "$ref" config \
+                       | grep -E '^\s+source: (\./|\.\./|[^/$])' ; then
+                      echo "the published compose has a relative bind mount" >&2
+                      echo "under oci:// that mounts Compose's cache dir, not the user's files" >&2
+                      exit 1
+                  fi
+                  echo "every bind mount is absolute"

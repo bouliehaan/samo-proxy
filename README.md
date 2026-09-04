@@ -40,11 +40,18 @@ broadcast cannot describe, say so on the same line:
 SAMOPROXY_ORIGIN=http://192.168.1.10:6969 docker compose -f oci://ghcr.io/bouliehaan/samo-proxy:compose up -d
 ```
 
-The tunnel is the one thing that needs a file, because a tunnel id and its
-credentials are deployment identity rather than configuration — put
-`config.yml` and the credentials JSON in `./cloudflared/` before bringing it up.
-Moving an existing tunnel across without recreating it is
-[docs/DEPLOY.md](docs/DEPLOY.md).
+The tunnel is the one thing that needs files of its own, because a tunnel id and
+its credentials are deployment identity rather than configuration. Put
+`config.yml` and the credentials JSON in `/etc/samo-proxy/cloudflared/` before
+bringing it up, or point `SAMOPROXY_TUNNEL_DIR` at wherever you keep them:
+
+```bash
+SAMOPROXY_TUNNEL_DIR=/opt/samo-proxy/cloudflared \
+  docker compose -f oci://ghcr.io/bouliehaan/samo-proxy:compose up -d
+```
+
+It has to be an absolute path. Moving an existing tunnel across without
+recreating it is [docs/DEPLOY.md](docs/DEPLOY.md).
 
 Both containers run with host networking: samo-proxy binds `127.0.0.1:6767`,
 cloudflared reaches it there, and nothing on the LAN can reach it at all. That
