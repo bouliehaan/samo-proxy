@@ -15,6 +15,10 @@
 
 services:
   samo-proxy:
+    # Published image, so `docker compose pull` installs without a toolchain.
+    # `build` is the fallback and is what deploy.sh uses (--build) to ship a
+    # working tree that is ahead of the release.
+    image: ghcr.io/bouliehaan/samo-proxy:latest
     build: .
     container_name: samo-proxy
     restart: unless-stopped
