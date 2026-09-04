@@ -33,7 +33,7 @@ git clone https://github.com/bouliehaan/samo-proxy.git
 cd samo-proxy
 cp cloudflared/config.yml.example cloudflared/config.yml   # tunnel id + hostnames
 echo 'SAMOPROXY_ORIGIN=http://192.168.1.10:6969' > .env    # your samo-server
-docker compose up -d
+docker compose pull && docker compose up -d
 ```
 
 That pulls [`ghcr.io/bouliehaan/samo-proxy:latest`](https://github.com/bouliehaan/samo-proxy/pkgs/container/samo-proxy)
