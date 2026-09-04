@@ -61,7 +61,9 @@ func Find(ctx context.Context, timeout time.Duration) (Server, error) {
 	if err != nil {
 		return Server{}, fmt.Errorf("open discovery socket: %w", err)
 	}
-	defer conn.Close()
+	// Explicitly discarded: this socket is read-only and about to go out of
+	// scope, so a close error tells the caller nothing they can act on.
+	defer func() { _ = conn.Close() }()
 
 	deadline := time.Now().Add(timeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
