@@ -51,6 +51,17 @@ fi
 # argument, where neither shell would expand it.
 TUNNEL_CREDS_SRC="${SAMOPROXY_TUNNEL_CREDS_SRC:-/home/${SAMO_BOX_USER}/.cloudflared/${TUNNEL_ID}.json}"
 
+# The hostnames for the cutover instructions come out of the (gitignored) tunnel
+# config, not from this script. Scrubbing the repo for publication replaced the
+# real domain here with example.com, which turned the final instructions into
+# URLs that cannot be pasted. Reading them from the config keeps the published
+# script generic AND the printed output real.
+HOSTNAMES="$(sed -n 's/^[[:space:]]*-[[:space:]]*hostname:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$SRC/cloudflared/config.yml" 2>/dev/null)"
+PRIMARY_HOST="$(printf '%s\n' "$HOSTNAMES" | head -1)"
+SECONDARY_HOST="$(printf '%s\n' "$HOSTNAMES" | sed -n 2p)"
+[ -n "$PRIMARY_HOST" ]   || PRIMARY_HOST="your-samo-hostname"
+[ -n "$SECONDARY_HOST" ] || SECONDARY_HOST="your-other-hostname"
+
 # ---- pretty printing ---------------------------------------------------------
 
 if [ -t 1 ]; then
@@ -329,15 +340,15 @@ printf "\n${C_OK}done.${C_OFF}\n\n"
 say "Cutover — verify first, then retire the old connector"
 note ""
 note "1. Check BOTH hostnames now serve through the new connector:"
-note "     curl -sI https://samo.example.com/health | head -1"
-note "     curl -sI https://tv.example.com/ | head -1"
+note "     curl -sI https://${PRIMARY_HOST}/health | head -1"
+note "     curl -sI https://${SECONDARY_HOST}/ | head -1"
 note "   Confirm samo is going through the proxy (this header is proof):"
-note "     curl -sI https://samo.example.com/api/v1/music/albums | grep -i samo-proxy"
+note "     curl -sI https://${PRIMARY_HOST}/api/v1/music/albums | grep -i samo-proxy"
 note ""
 note "2. Only once those look right, on the SAMO box (${SAMO_BOX}):"
 note "     sudo systemctl disable --now cloudflared"
 note ""
-note "   Do NOT stop nginx on that box. It still serves tv.example.com,"
+note "   Do NOT stop nginx on that box. It still serves ${SECONDARY_HOST},"
 note "   which the new tunnel reaches over the LAN at https://${SAMO_BOX}:443."
 note "   Only the cloudflared unit moves; nginx stays exactly where it is."
 note ""

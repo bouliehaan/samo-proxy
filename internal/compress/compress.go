@@ -16,6 +16,7 @@ package compress
 import (
 	"compress/gzip"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -117,11 +118,11 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 
 // Flush is what makes an event stream work through this wrapper. Reaching it
 // means the handler wants bytes on the wire now, which is incompatible with
-// waiting to see if the body grows past minBytes — so an unflushed decision is
-// resolved as "do not compress".
+// waiting to see if the body grows past minBytes — so the decision has to be
+// taken here, on what is known rather than on the body's final size.
 func (w *responseWriter) Flush() {
 	if !w.decided {
-		w.commitPlain()
+		w.commitFlushed()
 	}
 	if w.gzip != nil {
 		_ = w.gzip.Flush()
@@ -149,6 +150,41 @@ func (w *responseWriter) eligible() bool {
 		}
 	}
 	return false
+}
+
+// commitFlushed resolves a response that was flushed before its body was big
+// enough to judge.
+//
+// Resolving this as "do not compress" is what silently switched the whole
+// package off in production. The reverse proxy runs with FlushInterval -1 —
+// which an endless radio stream and the SSE channel both need — and that means
+// httputil flushes after EVERY write, including the first one. So a JSON
+// response whose first read off the origin came back under minBytes was
+// committed to plain before the rest of it had even arrived, and samo-server
+// sends nearly everything chunked. Measured against the real binary: a 4700
+// byte catalog response left the proxy as 4700 bytes, where the same body
+// through the same middleware without the proxy in front leaves as 99.
+//
+// The content type still decides first, and that is what keeps the streaming
+// paths untouched: text/event-stream is excluded by eligible(), and so is
+// every audio and image type, so a live channel and the dashboard's SSE feed
+// resolve to plain here exactly as before. What is left is the compressible
+// case, where a flush means "this is being streamed to me in pieces" — and a
+// streamed JSON body is the one this proxy exists to shrink.
+//
+// A declared Content-Length below the threshold is the one case where the
+// answer is still knowable, and it keeps the tiny-body rule exact rather than
+// approximate.
+func (w *responseWriter) commitFlushed() {
+	if !w.eligible() {
+		w.commitPlain()
+		return
+	}
+	if declared, err := strconv.Atoi(w.Header().Get("Content-Length")); err == nil && declared < w.minBytes {
+		w.commitPlain()
+		return
+	}
+	w.commitGzip()
 }
 
 func (w *responseWriter) commitPlain() {

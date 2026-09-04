@@ -26,11 +26,13 @@ import (
 
 // Handler is the whole proxy.
 type Handler struct {
-	cfg     *config.Config
-	log     *slog.Logger
-	proxy   *httputil.ReverseProxy
-	origin  *http.Client
-	store   *cache.Cache
+	cfg    *config.Config
+	log    *slog.Logger
+	proxy  *httputil.ReverseProxy
+	origin *http.Client
+	// store is a guardedCache rather than a *cache.Cache so that no cached body
+	// can be read without a request to authorize it. See cachegate.go.
+	store   *guardedCache
 	encoder transcode.Encoder
 	profile transcode.Profile
 }
@@ -54,7 +56,7 @@ func New(cfg *config.Config, store *cache.Cache, logger *slog.Logger) *Handler {
 	handler := &Handler{
 		cfg:   cfg,
 		log:   logger,
-		store: store,
+		store: newGuardedCache(store),
 		origin: &http.Client{
 			Transport: transport,
 			// A redirect is a response the client needs to see, not something
@@ -83,6 +85,16 @@ func New(cfg *config.Config, store *cache.Cache, logger *slog.Logger) *Handler {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.Error("origin request failed", "path", r.URL.Path, "error", err)
 			http.Error(w, "origin unavailable", http.StatusBadGateway)
+		},
+		// Every plain request the origin accepts teaches the cache gate that
+		// this caller's credential is good. This is where the gate gets warm in
+		// practice: a client has always made authenticated API calls before it
+		// asks for the artwork on the page those calls described.
+		ModifyResponse: func(response *http.Response) error {
+			if response.StatusCode < 400 && response.Request != nil {
+				handler.store.Admit(response.Request)
+			}
+			return nil
 		},
 	}
 	return handler
@@ -118,6 +130,12 @@ func (h *Handler) rewrite(r *httputil.ProxyRequest) {
 // So: believe the header only from a trusted source, and otherwise replace it
 // with the address we actually saw. Either way the origin receives exactly one
 // authoritative value, set rather than appended.
+//
+// The reverse proxy and the hand-built requests in fetchOrigin/revalidate both
+// arrive here. They used to run two byte-identical copies of this logic, one of
+// which carried a comment saying the two must never diverge — which is a rule
+// somebody has to keep rather than a thing that stays true. One implementation,
+// two callers.
 func (h *Handler) sanitizeForwarded(in, out *http.Request) {
 	clientIP := remoteIP(in.RemoteAddr)
 	if h.cfg.TrustsAddr(in.RemoteAddr) {
@@ -213,7 +231,7 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request) {
 
 	key := cache.Key("image", r.URL.Path, classify.CacheKeyQuery(r.URL.Query()), itoa(width))
 
-	if file, meta, ok := h.store.Open(key); ok {
+	if file, meta, ok := h.openAuthorized(r, key); ok {
 		defer file.Close()
 		if meta.ContentType != "" {
 			w.Header().Set("Content-Type", meta.ContentType)
@@ -296,14 +314,24 @@ func (h *Handler) serveAudio(w http.ResponseWriter, r *http.Request) {
 		h.profile.String(),
 	)
 
-	if file, meta, ok := h.store.Open(key); ok {
+	// Peek reads the entry's metadata, not its body, so it needs no
+	// authorization — and it must not require one. Revalidation is what
+	// authorizes this path: it puts the caller's own credential in front of the
+	// origin, so a rotated stream token is accepted here exactly as the origin
+	// accepts it, and the cache still hits. Reading the body first and checking
+	// afterwards would turn every 30-minute token rotation into a re-fetch of
+	// the whole lossless source.
+	if meta, ok := h.store.Peek(key); ok {
 		fresh, err := h.revalidate(r, meta)
 		if err == nil && fresh {
-			defer file.Close()
-			h.serveCached(w, r, file, meta)
-			return
+			// revalidate admitted this caller, so the body opens.
+			file, _, opened := h.store.Open(r, key)
+			if opened {
+				defer file.Close()
+				h.serveCached(w, r, file, meta)
+				return
+			}
 		}
-		file.Close()
 		if err == nil && !fresh {
 			h.log.Info("cache entry stale, dropping", "path", r.URL.Path)
 			h.store.Drop(key)
@@ -329,7 +357,7 @@ func (h *Handler) serveAudio(w http.ResponseWriter, r *http.Request) {
 
 	// Someone else is already encoding this. Follow their output rather than
 	// starting a second ffmpeg over the same file.
-	if reader, meta, ok := h.store.Follow(key); ok {
+	if reader, meta, ok := h.store.Follow(r, key); ok {
 		defer reader.Close()
 		h.streamEncoded(w, reader, meta.ContentType)
 		return
@@ -394,7 +422,7 @@ func (h *Handler) encodeAndStream(w http.ResponseWriter, r *http.Request, key st
 		// Lost a race with another request between Follow and Begin. Follow
 		// that one instead of encoding the same file twice.
 		originResponse.Body.Close()
-		if reader, followMeta, ok := h.store.Follow(key); ok {
+		if reader, followMeta, ok := h.store.Follow(r, key); ok {
 			defer reader.Close()
 			h.streamEncoded(w, reader, followMeta.ContentType)
 			return
@@ -491,28 +519,37 @@ func (h *Handler) fetchOrigin(r *http.Request) (*http.Response, error) {
 	request.Host = r.Host
 	h.applyForwardedTo(r, request)
 
-	return h.origin.Do(request)
+	response, err := h.origin.Do(request)
+	if err == nil && response.StatusCode < 400 {
+		// The origin served this caller, so the cache gate may serve them too.
+		h.store.Admit(r)
+	}
+	return response, err
 }
 
-// revalidate asks the origin whether a cached entry still matches the source.
+// probeOrigin asks the origin about a URL with the cheapest request that
+// carries a real answer: a one-byte ranged GET. It is the same trick
+// samo-server's own podcast stream service uses, because some servers refuse
+// HEAD outright.
 //
-// samo-server serves audio as `private, max-age=3600` precisely because a
-// file's contents can change under a stable URL — a re-tag, a replaced
-// download — so an entry that is never revalidated would serve stale audio
-// indefinitely. A one-byte ranged GET is the cheapest way to ask: it is the
-// same trick samo-server's own podcast stream service uses, because some
-// servers refuse HEAD outright.
-func (h *Handler) revalidate(r *http.Request, meta cache.Meta) (bool, error) {
+// One request answers both questions a cache hit needs settled: may THIS caller
+// have this URL, and do the origin's validators still match what we stored.
+// Keeping it in one function is deliberate — the authorization half is easy to
+// leave out of a second copy, and leaving it out is precisely how the artwork
+// path became readable without credentials.
+//
+// A success admits the caller to the cache gate. The caller owns the response
+// body.
+func (h *Handler) probeOrigin(r *http.Request) (*http.Response, error) {
 	target := *h.cfg.Origin
 	target.Path = h.cfg.Origin.Path + r.URL.Path
 	target.RawQuery = r.URL.RawQuery
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		return false, err
+		cancel()
+		return nil, err
 	}
 	copyHeader(request.Header, r.Header)
 	request.Header.Set("Range", "bytes=0-0")
@@ -525,18 +562,84 @@ func (h *Handler) revalidate(r *http.Request, meta cache.Meta) (bool, error) {
 
 	response, err := h.origin.Do(request)
 	if err != nil {
-		return false, err
+		cancel()
+		return nil, err
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<10))
-		response.Body.Close()
-	}()
+	// The body is tiny and fully drained by every caller, so releasing the
+	// context here rather than leaking the cancel func is safe.
+	cancel()
 
-	// An auth failure or a vanished file is not staleness — it is the origin's
-	// answer, and the caller should let the origin give it directly.
+	// An auth failure or a vanished file is the origin's answer, not staleness
+	// and not permission.
 	if response.StatusCode != http.StatusPartialContent && response.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("revalidate: origin returned %d", response.StatusCode)
+		drainAndClose(response)
+		return nil, fmt.Errorf("origin returned %d", response.StatusCode)
 	}
+	// The origin served this caller, so the gate may serve them cached bytes
+	// for this URL — and the covers on the page they are playing from.
+	h.store.Admit(r)
+	return response, nil
+}
+
+// authorizeFromOrigin settles permission alone, for a cached response that has
+// no freshness question to ask.
+//
+// Artwork is immutable by content id — samo-server serves it
+// `public, max-age=31536000, immutable` — so there is nothing to revalidate.
+// But "nothing to revalidate" is not "nobody to authorize", and treating the
+// two as the same thing is what let a cached cover be read without a token.
+// One one-byte request, only when the gate does not already know the caller.
+func (h *Handler) authorizeFromOrigin(r *http.Request) error {
+	response, err := h.probeOrigin(r)
+	if err != nil {
+		return err
+	}
+	drainAndClose(response)
+	return nil
+}
+
+// drainAndClose releases a probe response, reading the little it carries so the
+// connection can be reused rather than dropped.
+func drainAndClose(response *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<10))
+	response.Body.Close()
+}
+
+// openAuthorized is the one way a cached body reaches a client.
+//
+// It answers the authorization question before any bytes move, from the gate
+// when it already knows the caller and from the origin when it does not — so a
+// freshly rotated stream token costs one one-byte request rather than a re-fetch
+// of the whole object, and an anonymous caller gets nothing either way.
+func (h *Handler) openAuthorized(r *http.Request, key string) (*os.File, cache.Meta, bool) {
+	meta, present := h.store.Peek(key)
+	if !present {
+		return nil, cache.Meta{}, false
+	}
+	if !h.store.Allows(r) {
+		if err := h.authorizeFromOrigin(r); err != nil {
+			return nil, cache.Meta{}, false
+		}
+	}
+	file, _, opened := h.store.Open(r, key)
+	if !opened {
+		return nil, cache.Meta{}, false
+	}
+	return file, meta, true
+}
+
+// revalidate asks the origin whether a cached entry still matches the source.
+//
+// samo-server serves audio as `private, max-age=3600` precisely because a
+// file's contents can change under a stable URL — a re-tag, a replaced
+// download — so an entry that is never revalidated would serve stale audio
+// indefinitely.
+func (h *Handler) revalidate(r *http.Request, meta cache.Meta) (bool, error) {
+	response, err := h.probeOrigin(r)
+	if err != nil {
+		return false, fmt.Errorf("revalidate: %w", err)
+	}
+	defer drainAndClose(response)
 
 	// Prefer a strong validator when the origin offers one.
 	if meta.OriginETag != "" {
@@ -559,23 +662,13 @@ func (h *Handler) revalidate(r *http.Request, meta cache.Meta) (bool, error) {
 	return true, nil
 }
 
-// applyForwardedTo mirrors the reverse proxy's header hygiene onto a request we
+// applyForwardedTo applies the reverse proxy's header hygiene to a request we
 // build ourselves, so the transcoding path cannot become a way around it.
+//
+// It delegates rather than duplicating: this used to be a second copy of
+// sanitizeForwarded's body, kept in step by hand.
 func (h *Handler) applyForwardedTo(in, out *http.Request) {
-	clientIP := remoteIP(in.RemoteAddr)
-	if h.cfg.TrustsAddr(in.RemoteAddr) {
-		if cf := strings.TrimSpace(in.Header.Get("CF-Connecting-IP")); cf != "" {
-			clientIP = cf
-		} else if xff := firstForwarded(in.Header.Get("X-Forwarded-For")); xff != "" {
-			clientIP = xff
-		}
-	}
-	out.Header.Set("CF-Connecting-IP", clientIP)
-	out.Header.Set("X-Forwarded-For", clientIP)
-	out.Header.Del("X-Real-IP")
-	out.Header.Del("Forwarded")
-	out.Header.Del("True-Client-IP")
-	out.Header.Set("X-Forwarded-Proto", h.cfg.ForwardedProto)
+	h.sanitizeForwarded(in, out)
 }
 
 // Health reports whether the origin is answering, for samo-proxy's own probe.

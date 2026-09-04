@@ -18,9 +18,17 @@ services:
     build: .
     container_name: samo-proxy
     restart: unless-stopped
-    # No `ports:` — nothing outside this compose network needs to reach it.
-    # Publishing it to the LAN would put a spoofable CF-Connecting-IP header in
-    # reach of anything on the network; see SAMOPROXY_TRUST_FORWARDED_FROM.
+    # The inbound listener gets no `ports:` — nothing outside this compose
+    # network needs to reach it. Publishing it to the LAN would put a spoofable
+    # CF-Connecting-IP header in reach of anything on the network; see
+    # SAMOPROXY_TRUST_FORWARDED_FROM.
+    #
+    # The egress listener below is the one exception, and it is a different
+    # port with a different trust model: it believes no headers at all, requires
+    # a shared secret, and will only connect to an allow-listed host. It is
+    # published only when SAMOPROXY_EGRESS_PORT is set.
+    ports:
+      - "${SAMOPROXY_EGRESS_PORT:-127.0.0.1:6768}:6768"
     environment:
       SAMOPROXY_ADDR: "0.0.0.0:6767"
 
@@ -55,6 +63,23 @@ services:
 
       SAMOPROXY_CACHE_DIR: "/var/cache/samo-proxy"
       SAMOPROXY_CACHE_MAX_MB: "${SAMOPROXY_CACHE_MAX_MB:-16384}"
+
+      # --- outbound egress, off unless SAMOPROXY_EGRESS_TOKEN is set ---------
+      #
+      # A CONNECT proxy the samo box can use to reach the few hosts that refuse
+      # its VPN exit address. Deezer's image CDN is the case that forced it:
+      # api.deezer.com answers the samo box normally, cdn-images.dzcdn.net
+      # answers every one of its requests with 403, so the artist photo
+      # backfill finds a picture per artist and downloads none of them.
+      #
+      # This is a hole in the VPN and it is meant to be a very small one. Only
+      # allow-listed hosts, only CONNECT, only web ports, and only with the
+      # token. Traffic through it does not go through the VPN — an artwork URL
+      # names something in the library, so keep the list as short as it can be.
+      # Unset SAMOPROXY_EGRESS_TOKEN to switch the whole thing off.
+      SAMOPROXY_EGRESS_ADDR: "${SAMOPROXY_EGRESS_TOKEN:+0.0.0.0:6768}"
+      SAMOPROXY_EGRESS_TOKEN: "${SAMOPROXY_EGRESS_TOKEN:-}"
+      SAMOPROXY_EGRESS_ALLOW_HOSTS: "${SAMOPROXY_EGRESS_ALLOW_HOSTS:-cdn-images.dzcdn.net,e-cdns-images.dzcdn.net,cdns-images.dzcdn.net}"
       SAMOPROXY_LOG_LEVEL: "${SAMOPROXY_LOG_LEVEL:-info}"
     volumes:
       # Transcodes survive restarts. Losing this is not data loss — it just

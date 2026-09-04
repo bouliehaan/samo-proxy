@@ -2,6 +2,7 @@ package forward
 
 import (
 	"bytes"
+	"compress/gzip"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/bouliehaan/samo-proxy/internal/cache"
+	"github.com/bouliehaan/samo-proxy/internal/compress"
 	"github.com/bouliehaan/samo-proxy/internal/config"
 )
 
@@ -534,4 +536,238 @@ func bigTestJPEG(t *testing.T, width, height int) []byte {
 		t.Fatalf("encode fixture: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// --- cache authorization -------------------------------------------------
+//
+// The cache key excludes credentials on purpose, so a cache hit is keyed on the
+// URL alone. These tests are the reason that is safe: they assert that a caller
+// the origin has not accepted is never handed cached bytes, for every media
+// type the proxy caches. A new cached type that skips the gate fails here.
+
+// A cover cached for a signed-in listener must not be served to a stranger who
+// guessed the URL.
+func TestCachedArtworkIsNotServedToAnAnonymousCaller(t *testing.T) {
+	var originHits int
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("stream_token") == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		originHits++
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bigTestJPEG(t, 1400, 1400))
+	}))
+	defer origin.Close()
+
+	handler := newHandler(t, testConfig(t, origin.URL))
+	const path = "/api/v1/media/images/img_1/image"
+
+	// A signed-in caller populates the cache.
+	authed := httptest.NewRequest(http.MethodGet, path+"?stream_token=good", nil)
+	authed.RemoteAddr = "127.0.0.1:1234"
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, authed)
+	if first.Code != http.StatusOK {
+		t.Fatalf("authorized artwork = %d, want 200", first.Code)
+	}
+
+	// The same caller again should be a cache hit, proving the entry exists.
+	repeat := httptest.NewRequest(http.MethodGet, path+"?stream_token=good", nil)
+	repeat.RemoteAddr = "127.0.0.1:1234"
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, repeat)
+	if got := second.Header().Get("X-Samo-Proxy-Image"); got != "hit" {
+		t.Fatalf("second authorized request = %q, want a cache hit to prove the entry is there", got)
+	}
+
+	// Now a stranger asks for the identical URL with no credential at all.
+	anonymous := httptest.NewRequest(http.MethodGet, path, nil)
+	anonymous.RemoteAddr = "127.0.0.1:9999"
+	third := httptest.NewRecorder()
+	handler.ServeHTTP(third, anonymous)
+
+	if third.Code == http.StatusOK {
+		t.Fatalf("anonymous caller got %d and %d bytes of cached artwork; the origin's 401 is the only correct answer",
+			third.Code, third.Body.Len())
+	}
+	if got := third.Header().Get("X-Samo-Proxy-Image"); got == "hit" {
+		t.Fatalf("anonymous caller was served from cache (%q)", got)
+	}
+}
+
+// Follow attaches a second listener to an encode already in flight. It looks
+// like an optimisation rather than a read, which is exactly why it needs the
+// same gate: without it an anonymous caller is handed live audio for as long as
+// somebody else's transcode is running.
+func TestFollowingAnInFlightEncodeRequiresAuthorization(t *testing.T) {
+	store, err := cache.New(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	guarded := newGuardedCache(store)
+
+	const key = "some-track"
+	sink, started := guarded.Begin(key, cache.Meta{ContentType: "audio/ogg"})
+	if !started {
+		t.Fatal("Begin did not start an entry")
+	}
+	defer sink.Close(nil)
+	if _, err := sink.Write([]byte("audio-bytes")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	anonymous := httptest.NewRequest(http.MethodGet, "/api/v1/music/tracks/t1/stream", nil)
+	if _, _, ok := guarded.Follow(anonymous, key); ok {
+		t.Fatal("an anonymous caller was allowed to follow an in-flight encode")
+	}
+
+	authed := httptest.NewRequest(http.MethodGet, "/api/v1/music/tracks/t1/stream?stream_token=good", nil)
+	guarded.Admit(authed)
+	reader, _, ok := guarded.Follow(authed, key)
+	if !ok {
+		t.Fatal("an admitted caller could not follow the encode")
+	}
+	reader.Close()
+}
+
+// A credential the origin never accepted must not become usable just because
+// somebody presented it.
+func TestGateOnlyTrustsWhatTheOriginAccepted(t *testing.T) {
+	gate := newCacheGate()
+	request := httptest.NewRequest(http.MethodGet, "/x?stream_token=abc", nil)
+
+	if gate.Allows(request) {
+		t.Fatal("gate trusted a credential before the origin ever saw it")
+	}
+	gate.Admit(request)
+	if !gate.Allows(request) {
+		t.Fatal("gate did not trust a credential the origin accepted")
+	}
+
+	other := httptest.NewRequest(http.MethodGet, "/x?stream_token=different", nil)
+	if gate.Allows(other) {
+		t.Fatal("admitting one credential admitted another")
+	}
+}
+
+// An anonymous request that succeeds means the route is public. That says
+// nothing about who may read cached bytes, so it must teach the gate nothing —
+// otherwise one public endpoint unlocks the whole cache for everyone.
+func TestASuccessfulAnonymousRequestAdmitsNobody(t *testing.T) {
+	gate := newCacheGate()
+	public := httptest.NewRequest(http.MethodGet, "/health", nil)
+
+	gate.Admit(public)
+	if gate.Allows(public) {
+		t.Fatal("an anonymous success admitted the empty credential")
+	}
+}
+
+// A revoked token keeps working on cached bytes only until the entry ages out.
+func TestAdmissionExpires(t *testing.T) {
+	gate := newCacheGate()
+	now := time.Now()
+	gate.now = func() time.Time { return now }
+
+	request := httptest.NewRequest(http.MethodGet, "/x?stream_token=abc", nil)
+	gate.Admit(request)
+	if !gate.Allows(request) {
+		t.Fatal("freshly admitted credential was refused")
+	}
+
+	now = now.Add(credentialTTL + time.Second)
+	if gate.Allows(request) {
+		t.Fatal("credential outlived its TTL")
+	}
+}
+
+// The gate is written to on every success, so it needs a ceiling. This is the
+// lesson from samo-server's stream token store, which grows without one.
+func TestGateIsBounded(t *testing.T) {
+	gate := newCacheGate()
+	gate.limit = 4
+
+	for i := 0; i < 50; i++ {
+		request := httptest.NewRequest(http.MethodGet, "/x?stream_token=t"+strconv.Itoa(i), nil)
+		gate.Admit(request)
+	}
+	if len(gate.seen) > gate.limit {
+		t.Fatalf("gate holds %d credentials, limit is %d", len(gate.seen), gate.limit)
+	}
+}
+
+// Compression has to survive the reverse proxy, and for a long time it did not.
+//
+// The proxy runs with FlushInterval -1, so httputil flushes after every write.
+// That reached compress.Middleware before the body had grown past its
+// threshold and resolved the response as "do not compress" — silently, on
+// every proxied route, which is every JSON route samo-server serves. The
+// package's own tests all passed, because they call the middleware directly
+// and nothing in them flushes.
+//
+// So the test lives here rather than in internal/compress: the bug was in the
+// seam between the two, and only an assembled chain can see it.
+func TestProxiedJSONIsCompressed(t *testing.T) {
+	body := strings.Repeat(`{"id":"internet-radio_0001","title":"Station"},`, 100)
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, origin.URL)
+	chain := compress.Middleware(cfg.CompressMinBytes, newHandler(t, cfg))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/internet-radio/stations", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	recorder := httptest.NewRecorder()
+	chain.ServeHTTP(recorder, request)
+
+	if got := recorder.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip: %d bytes of JSON crossed the uplink raw", got, recorder.Body.Len())
+	}
+	if recorder.Body.Len() >= len(body) {
+		t.Errorf("gzip did not shrink the body: %d -> %d", len(body), recorder.Body.Len())
+	}
+
+	reader, err := gzip.NewReader(bytes.NewReader(recorder.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("response is not valid gzip: %v", err)
+	}
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(decoded) != body {
+		t.Error("decompressed body did not round-trip")
+	}
+}
+
+// The other half of the same decision: a live stream must still reach the
+// client the instant it is written, compressor or not.
+func TestProxiedEventStreamIsNotCompressed(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, ": connected\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, origin.URL)
+	chain := compress.Middleware(cfg.CompressMinBytes, newHandler(t, cfg))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	recorder := httptest.NewRecorder()
+	chain.ServeHTTP(recorder, request)
+
+	if got := recorder.Header().Get("Content-Encoding"); got != "" {
+		t.Errorf("event stream was compressed (Content-Encoding %q)", got)
+	}
+	if body := recorder.Body.String(); body != ": connected\n\n" {
+		t.Errorf("body = %q, want the raw SSE comment", body)
+	}
 }

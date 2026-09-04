@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	"github.com/bouliehaan/samo-proxy/internal/cache"
 	"github.com/bouliehaan/samo-proxy/internal/compress"
 	"github.com/bouliehaan/samo-proxy/internal/config"
+	"github.com/bouliehaan/samo-proxy/internal/egress"
 	"github.com/bouliehaan/samo-proxy/internal/forward"
 )
 
@@ -82,6 +84,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// The egress proxy is a second listener rather than another route on the
+	// first, and that separation is deliberate. The inbound listener's whole
+	// trust model is "only cloudflared can reach this, so its forwarding
+	// headers may be believed" (see config.TrustedCIDRs); the egress listener
+	// has to be reachable from the LAN for samo-server to use it. Folding the
+	// two together would mean widening the first to serve the second, which is
+	// precisely the mistake the README warns about.
+	egressServer, err := startEgress(cfg, logger, stop)
+	if err != nil {
+		logger.Error("egress proxy unavailable", "error", err)
+		os.Exit(1)
+	}
+
 	go func() {
 		logger.Info("samo-proxy listening",
 			"addr", cfg.Addr,
@@ -107,6 +122,63 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown incomplete", "error", err)
 	}
+	if egressServer != nil {
+		if err := egressServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("egress shutdown incomplete", "error", err)
+		}
+	}
+}
+
+// startEgress brings up the outbound CONNECT proxy, or returns (nil, nil) when
+// it is not configured. A configuration error is fatal rather than a warning:
+// somebody who set SAMOPROXY_EGRESS_ADDR wants that port open, and a proxy that
+// quietly declined would show up as artist photos still failing days later.
+func startEgress(cfg *config.Config, logger *slog.Logger, stop context.CancelFunc) (*http.Server, error) {
+	if !cfg.EgressEnabled() {
+		return nil, nil
+	}
+
+	allow, err := egress.ParseHostSet(cfg.EgressAllowHosts)
+	if err != nil {
+		return nil, err
+	}
+	handler, err := egress.New(egress.Options{
+		Allow:  allow,
+		Token:  cfg.EgressToken,
+		Logger: logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	server := &http.Server{
+		Addr:    cfg.EgressAddr,
+		Handler: handler,
+		// No ReadTimeout or WriteTimeout: a CONNECT tunnel is hijacked out from
+		// under the server and manages its own idle deadlines, and a timeout
+		// here would cut a large download in the middle.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelDebug),
+	}
+
+	listener, err := net.Listen("tcp", cfg.EgressAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		logger.Info("egress proxy listening",
+			"addr", cfg.EgressAddr,
+			"allow", allow.String(),
+		)
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("egress listener failed", "error", err)
+			stop()
+		}
+	}()
+	return server, nil
 }
 
 func newLogger(level string) *slog.Logger {

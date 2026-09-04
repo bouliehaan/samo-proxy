@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/bouliehaan/samo-proxy/internal/egress"
 )
 
 // Config is the fully-resolved runtime configuration.
@@ -87,6 +89,25 @@ type Config struct {
 	// forced the client's no-reuse pool (see samo's SamoHttp.kt).
 	OriginIdleConns int
 
+	// EgressAddr is the listen address for the outbound CONNECT proxy that lets
+	// the samo box reach the few hosts which refuse its VPN exit address. Empty
+	// disables the feature entirely, and empty is the default: nothing should
+	// leave the VPN unless an operator has decided that it must.
+	//
+	// Unlike Addr, this one has to be reachable from the LAN, because samo-server
+	// is on another box. That is exactly why EgressToken is mandatory whenever it
+	// is set. See internal/egress for the full reasoning.
+	EgressAddr string
+
+	// EgressAllowHosts is the closed list of names the egress proxy will connect
+	// to, comma separated. An entry is either an exact host or a suffix written
+	// with a leading dot.
+	EgressAllowHosts string
+
+	// EgressToken is the shared secret samo-server presents. Required whenever
+	// EgressAddr is set; there is no unauthenticated mode.
+	EgressToken string
+
 	LogLevel string
 }
 
@@ -122,6 +143,9 @@ func Load() (*Config, error) {
 		CacheMaxBytes:     int64(envInt("SAMOPROXY_CACHE_MAX_MB", defaultCacheMaxBytes>>20)) << 20,
 		OriginDialTimeout: envDuration("SAMOPROXY_ORIGIN_DIAL_TIMEOUT", defaultOriginDialTimeout),
 		OriginIdleConns:   envInt("SAMOPROXY_ORIGIN_IDLE_CONNS", defaultOriginIdleConns),
+		EgressAddr:        env("SAMOPROXY_EGRESS_ADDR", ""),
+		EgressAllowHosts:  env("SAMOPROXY_EGRESS_ALLOW_HOSTS", strings.Join(egress.DefaultAllowHosts, ",")),
+		EgressToken:       env("SAMOPROXY_EGRESS_TOKEN", ""),
 		LogLevel:          strings.ToLower(env("SAMOPROXY_LOG_LEVEL", "info")),
 	}
 
@@ -167,7 +191,23 @@ func (c *Config) validate() error {
 	if c.TranscodeEnabled && strings.TrimSpace(c.CacheDir) == "" {
 		return fmt.Errorf("SAMOPROXY_TRANSCODE is on but SAMOPROXY_CACHE_DIR is empty")
 	}
+	// An egress listener without a token would be an open proxy on the LAN,
+	// sitting on the one route in the house that is not behind the VPN. Refuse
+	// to start rather than open it: this is the mistake that looks like it works.
+	if strings.TrimSpace(c.EgressAddr) != "" {
+		if strings.TrimSpace(c.EgressToken) == "" {
+			return fmt.Errorf("SAMOPROXY_EGRESS_ADDR is set but SAMOPROXY_EGRESS_TOKEN is empty")
+		}
+		if _, err := egress.ParseHostSet(c.EgressAllowHosts); err != nil {
+			return fmt.Errorf("SAMOPROXY_EGRESS_ALLOW_HOSTS: %w", err)
+		}
+	}
 	return nil
+}
+
+// EgressEnabled reports whether the outbound proxy should be started.
+func (c *Config) EgressEnabled() bool {
+	return strings.TrimSpace(c.EgressAddr) != ""
 }
 
 // TrustsAddr reports whether headers from this remote address may be believed.

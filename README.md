@@ -90,6 +90,88 @@ brute-force protection.
   `internal/classify` is an allow-list of exact shapes, so a new samo-server
   route costs a missed optimisation, never a broken response.
 
+## Letting the samo box out, narrowly
+
+Everything above is inbound. This part is the other direction, and it is off
+unless you deliberately turn it on.
+
+The samo box's kill-switch sends every outbound packet through ProtonVPN, which
+is correct and should stay. But a commercial VPN exit address is a datacenter
+address, and some CDNs refuse those outright. Deezer's artist artwork is the
+case that forced this: from the samo box, `api.deezer.com` returns byte-
+identical payloads to any other client, while **every** request to
+`cdn-images.dzcdn.net` comes back `403`. So the artist photo backfill finds a
+picture for an artist and then cannot download a single one of them. Measured
+on the box, 20 consecutive requests, 20 refusals; from this box, 5 of 5 fine.
+
+samo-proxy already sits on a machine whose default route is the plain WAN, so it
+is the natural place to put a door. `internal/egress` is that door, and it is
+deliberately a small one:
+
+- **Only allow-listed hosts.** The list is closed, not a default-open policy
+  with exceptions. It ships containing Deezer's image CDN and nothing else —
+  notably *not* `api.deezer.com`, which works fine over the VPN and stays there,
+  which is what keeps the search terms (artist names out of your library) on the
+  VPN where they belong.
+- **Only CONNECT, only ports 80 and 443.** Not a general TCP relay. Because it
+  is CONNECT rather than a fetching proxy, samo-proxy never sees the bytes —
+  samo-server's TLS runs end to end to the CDN.
+- **Only with the token.** The listener has to be reachable from the LAN for
+  samo-server to use it, so an unauthenticated one would be an open proxy on the
+  one route in the house that is not behind the VPN. Starting without a token is
+  a startup error, not a warning.
+- **Never into the LAN.** The allow-list is a list of *names*, and names are
+  resolved by DNS this process does not control. The dialer therefore refuses
+  any destination that resolves to a loopback, private, link-local or CGNAT
+  address — checked after resolution, which is what closes the rebinding window.
+  immich and nextcloud are on this box; this is what keeps the egress port from
+  reaching them.
+
+### The tradeoff, stated rather than buried
+
+**Traffic through this door does not go through the VPN.** An artwork request
+carries the image id of an artist in your library, so an observer on the WAN
+side learns which artists are being looked up, and when. That is strictly more
+than they learned before, when the answer was nothing at all.
+
+It is a much smaller leak than moving the library's whole metadata surface off
+the VPN, and it is bounded by a list you control. But it is not zero, which is
+why it defaults to off and why the list ships as short as it can be. If that
+trade is not one you want, leave `SAMOPROXY_EGRESS_TOKEN` unset and the port is
+never opened.
+
+### Turning it on
+
+```bash
+# On the edge box, in the samo-proxy .env:
+SAMOPROXY_EGRESS_TOKEN=$(openssl rand -base64 32)
+SAMOPROXY_EGRESS_PORT=0.0.0.0:6768        # reachable from the LAN
+```
+
+Then point samo-server at it — see `SAMO_EGRESS_PROXY_URL` in that repo. It
+routes only the listed hosts through the proxy and leaves every other request,
+including the Deezer lookup, on the VPN exactly as before.
+
+**samo-server treats this proxy as preferred, never required.** If it is not
+running, not reachable, or refuses the token, samo-server logs the reason once
+and falls back to its ordinary route, skipping the proxy for two minutes so a
+long backfill does not pay a dial timeout per artist. That is the right default
+in both directions: the fallback path *is* the VPN, so degrading to it is more
+private rather than less, and the worst case is artwork failing the way it did
+before this existed. So you can stop this stack, or never deploy it at all,
+without breaking samo-server.
+
+Verify from the samo box itself:
+
+```bash
+curl -x "http://samo:$TOKEN@192.168.1.12:6768" -o /dev/null -w '%{http_code}\n' \
+  https://cdn-images.dzcdn.net/images/artist/8d13c0527064ba50cf0d0873f4f574dc/1000x1000-000000-80-0-0.jpg
+```
+
+`200` through the proxy where the same URL direct gives `403` is the whole
+feature. A host that is not on the list gives `403` from samo-proxy, and a wrong
+token gives `407`; both are logged with the reason.
+
 ## Trust
 
 The security-critical setting is `SAMOPROXY_TRUST_FORWARDED_FROM`.
@@ -137,6 +219,10 @@ only `SAMOPROXY_ORIGIN` ever needs setting.
 | `SAMOPROXY_CACHE_MAX_MB` | `16384` | LRU eviction above this |
 | `SAMOPROXY_COMPRESS_MIN_BYTES` | `1024` | Below this, gzip costs more than it saves |
 | `SAMOPROXY_FFMPEG` | `ffmpeg` | |
+| `SAMOPROXY_EGRESS_TOKEN` | *(unset)* | Shared secret. **Setting it is what turns egress on.** |
+| `SAMOPROXY_EGRESS_ADDR` | `0.0.0.0:6768` when a token is set | Egress listener |
+| `SAMOPROXY_EGRESS_ALLOW_HOSTS` | Deezer image CDN only | Closed list; exact host or `.suffix` |
+| `SAMOPROXY_EGRESS_PORT` | `127.0.0.1:6768` | Host side of the published port. Set to `0.0.0.0:6768` to reach it from the LAN |
 | `SAMOPROXY_LOG_LEVEL` | `info` | |
 
 Responses carry `X-Samo-Proxy-Transcode` (`opus@128k` or `passthrough`) and
