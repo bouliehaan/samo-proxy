@@ -101,6 +101,7 @@ func main() {
 		logger.Info("samo-proxy listening",
 			"addr", cfg.Addr,
 			"origin", cfg.Origin.String(),
+			"originFrom", originSource(cfg),
 			"transcode", transcodeSummary(cfg),
 			"imageWidth", cfg.ImageDefaultWidth,
 			"cacheDir", cfg.CacheDir,
@@ -179,6 +180,15 @@ func startEgress(cfg *config.Config, logger *slog.Logger, stop context.CancelFun
 		}
 	}()
 	return server, nil
+}
+
+// originSource says whether the origin was found on the LAN or configured, so
+// a proxy pointed at the wrong server is one log line away from being obvious.
+func originSource(cfg *config.Config) string {
+	if cfg.OriginDiscovered {
+		return "discovery"
+	}
+	return "SAMOPROXY_ORIGIN"
 }
 
 func newLogger(level string) *slog.Logger {

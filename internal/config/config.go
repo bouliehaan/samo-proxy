@@ -7,6 +7,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bouliehaan/samo-proxy/internal/discover"
 	"github.com/bouliehaan/samo-proxy/internal/egress"
 )
 
@@ -27,6 +29,12 @@ type Config struct {
 
 	// Origin is the samo-server base URL on the LAN, e.g. http://192.168.1.10:6969.
 	Origin *url.URL
+
+	// OriginDiscovered records that Origin came from a LAN broadcast rather
+	// than SAMOPROXY_ORIGIN, so startup can say which one it is using. A
+	// discovered origin that turns out to be the wrong server is otherwise
+	// indistinguishable from a configured one that is wrong.
+	OriginDiscovered bool
 
 	// ForwardedProto is what to tell samo-server the client's scheme was.
 	// cloudflared terminates TLS at Cloudflare's edge and forwards plain HTTP,
@@ -112,8 +120,11 @@ type Config struct {
 }
 
 const (
-	defaultAddr              = "127.0.0.1:6767"
-	defaultOrigin            = "http://192.168.1.10:6969"
+	defaultAddr = "127.0.0.1:6767"
+	// How long to wait for a samo-server to answer a discovery broadcast. Long
+	// enough for a busy LAN, short enough that a misconfigured deployment fails
+	// with a useful message instead of appearing to hang on boot.
+	discoveryTimeout         = 3 * time.Second
 	defaultCompressMinBytes  = 1024
 	defaultImageWidth        = 768
 	defaultTranscodeCodec    = "opus"
@@ -149,11 +160,12 @@ func Load() (*Config, error) {
 		LogLevel:          strings.ToLower(env("SAMOPROXY_LOG_LEVEL", "info")),
 	}
 
-	origin, err := parseOrigin(env("SAMOPROXY_ORIGIN", defaultOrigin))
+	origin, discovered, err := resolveOrigin()
 	if err != nil {
 		return nil, err
 	}
 	cfg.Origin = origin
+	cfg.OriginDiscovered = discovered
 
 	trusted, err := parseCIDRs(env("SAMOPROXY_TRUST_FORWARDED_FROM", "127.0.0.0/8,::1/128"))
 	if err != nil {
@@ -165,6 +177,40 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// resolveOrigin decides which samo-server to proxy to.
+//
+// An explicit SAMOPROXY_ORIGIN always wins — a deployment that reaches its
+// server through a route a broadcast cannot describe has to be able to say so.
+// With nothing set we ask the LAN, because samo-server has answered that
+// question since before this proxy existed and the alternative is an address
+// someone has to look up and type correctly.
+//
+// There is deliberately no fallback address. This used to default to one
+// particular house's server, which is fine until somebody else installs it and
+// silently proxies to a machine that is not theirs.
+func resolveOrigin() (*url.URL, bool, error) {
+	if configured := strings.TrimSpace(os.Getenv("SAMOPROXY_ORIGIN")); configured != "" {
+		origin, err := parseOrigin(configured)
+		return origin, false, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
+	defer cancel()
+
+	server, err := discover.Find(ctx, discoveryTimeout)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"could not find a samo-server on the LAN (%w). Set SAMOPROXY_ORIGIN to its "+
+				"address, e.g. http://192.168.1.10:6969. Discovery is a UDP broadcast, so "+
+				"it needs host networking or a process on the host — a container on Docker's "+
+				"default bridge cannot send one",
+			err,
+		)
+	}
+	origin, err := parseOrigin(server.Address)
+	return origin, true, err
 }
 
 func (c *Config) validate() error {
