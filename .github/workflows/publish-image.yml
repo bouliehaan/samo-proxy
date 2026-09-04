@@ -1,0 +1,61 @@
+# Publishes the container image people actually install from.
+#
+# deploy.sh in this repo is maintainer tooling — it ships a working tree over
+# ssh and builds on the target. That is not an install path for anyone else, so
+# a release is not usable until the image below exists.
+#
+# Fires on a version tag. workflow_dispatch is there to (re)build an image for a
+# tag that already exists, which is how v1.0.0 got its first image.
+name: Publish container image
+
+on:
+    push:
+        tags: ['v*']
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: Tag to build an image for
+                required: true
+                default: v1.0.0
+
+jobs:
+    image:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write
+
+        steps:
+            - name: Check out the tag being released
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.inputs.ref || github.ref }}
+
+            - name: Work out the version to tag the image with
+              id: version
+              run: echo "value=${{ github.event.inputs.ref || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+            - uses: docker/setup-qemu-action@v3
+            - uses: docker/setup-buildx-action@v3
+
+            - name: Log in to ghcr.io
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            # arm64 builds under emulation here — the Dockerfile's build stage is
+            # a plain `FROM golang:1.26-alpine` with no BUILDPLATFORM split. It is
+            # a small CGO-free binary, so the emulated compile is tolerable.
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  push: true
+                  platforms: linux/amd64,linux/arm64
+                  tags: |
+                      ghcr.io/${{ github.repository }}:${{ steps.version.outputs.value }}
+                      ghcr.io/${{ github.repository }}:latest
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
