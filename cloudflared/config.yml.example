@@ -16,7 +16,7 @@ tunnel: 00000000-0000-0000-0000-000000000000
 credentials-file: /etc/cloudflared/00000000-0000-0000-0000-000000000000.json
 
 ingress:
-  # samo: straight to samo-proxy over the compose bridge network.
+  # samo: straight to samo-proxy, which binds loopback on this host.
   #
   # Plain HTTP is correct here and is not a downgrade. This hop is
   # container-to-container inside one Docker network on one host — it never
@@ -28,7 +28,7 @@ ingress:
   # through nginx over TLS that the tunnel then declined to verify
   # (noTLSVerify), which is encryption without authentication.
   - hostname: samo.example.com
-    service: http://samo-proxy:6767
+    service: http://127.0.0.1:6767
 
   # tv (Jellyfin): still served by nginx on the samo box, reached across the
   # LAN. This is the one hop that crosses a real network, so it gets real TLS.

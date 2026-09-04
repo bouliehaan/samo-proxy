@@ -8,36 +8,33 @@
 # throughput ceiling. Moving cloudflared to a machine whose default route is the
 # plain WAN removes all of that, and samo-server keeps its kill-switch intact.
 #
-# Nothing here is published to the LAN. cloudflared reaches samo-proxy over the
-# compose network, and samo-proxy is the only thing that talks to samo-server.
-# That is deliberate: samo-proxy believes CF-Connecting-IP from its trusted
-# sources, and the whole point is that only cloudflared is one of them.
+# Both containers use host networking, and samo-proxy binds loopback. That is
+# what makes the trust model simple: cloudflared reaches it on 127.0.0.1:6767
+# and nothing else on the network can reach it at all, so the only source of
+# CF-Connecting-IP is the one process allowed to set it.
+#
+# Host networking is also what lets samo-proxy find samo-server by itself. LAN
+# discovery is a UDP broadcast, and a container on Docker's default bridge
+# cannot send one — the same constraint that makes samo-server run this way.
 
 services:
   samo-proxy:
-    # Published image, so `docker compose pull` installs without a toolchain.
-    # `build` is the fallback, for running a working tree ahead of the release
-    # with `docker compose up -d --build`.
     image: ghcr.io/bouliehaan/samo-proxy:latest
-    build: .
     container_name: samo-proxy
     restart: unless-stopped
-    # The inbound listener gets no `ports:` — nothing outside this compose
-    # network needs to reach it. Publishing it to the LAN would put a spoofable
-    # CF-Connecting-IP header in reach of anything on the network; see
-    # SAMOPROXY_TRUST_FORWARDED_FROM.
-    #
-    # The egress listener below is the one exception, and it is a different
-    # port with a different trust model: it believes no headers at all, requires
-    # a shared secret, and will only connect to an allow-listed host. It is
-    # published only when SAMOPROXY_EGRESS_PORT is set.
-    ports:
-      - "${SAMOPROXY_EGRESS_PORT:-127.0.0.1:6768}:6768"
+    network_mode: host
     environment:
-      SAMOPROXY_ADDR: "0.0.0.0:6767"
+      # Loopback: cloudflared is on the same host stack and reaches it here,
+      # and nothing on the LAN can. The egress listener is the one thing that
+      # binds outward, and it has a different trust model — it believes no
+      # headers at all, requires a shared secret, and only connects to
+      # allow-listed hosts. It stays off unless SAMOPROXY_EGRESS_TOKEN is set.
+      SAMOPROXY_ADDR: "127.0.0.1:6767"
 
-      # samo-server on the LAN. The one setting you must get right.
-      SAMOPROXY_ORIGIN: "${SAMOPROXY_ORIGIN:-http://192.168.1.10:6969}"
+      # Left empty on purpose: samo-proxy asks the LAN which samo-server to use,
+      # the same way the Android and desktop clients do. Set it only if your
+      # server is somewhere a broadcast cannot describe.
+      SAMOPROXY_ORIGIN: "${SAMOPROXY_ORIGIN:-}"
 
       # cloudflared terminates TLS at Cloudflare's edge and forwards plain
       # HTTP, so samo-server cannot work the real scheme out for itself.
@@ -48,9 +45,10 @@ services:
       # Whose CF-Connecting-IP we believe. This is the security-critical knob:
       # samo-server's login limiter keys its brute-force lockout on that header,
       # so anything allowed to set it gets an unlimited supply of rate-limit
-      # buckets. Docker's default bridge is a /16; scope this to the compose
-      # network so it means "cloudflared", not "any container on this host".
-      SAMOPROXY_TRUST_FORWARDED_FROM: "${SAMOPROXY_TRUST_FORWARDED_FROM:-172.23.0.0/16}"
+      # buckets. Loopback means cloudflared and nothing else — strictly tighter
+      # than the compose subnet this used to name, which was every container on
+      # the host.
+      SAMOPROXY_TRUST_FORWARDED_FROM: "${SAMOPROXY_TRUST_FORWARDED_FROM:-127.0.0.0/8,::1/128}"
 
       # Lossless in, Opus out. A 24/96 FLAC is ~4.5 Mbps sustained; 128k Opus
       # is transparent enough for streaming and ~35x smaller.
@@ -99,6 +97,7 @@ services:
     # and reusing it means the tunnel UUID, the DNS records and every public
     # hostname carry over untouched — only the machine running the connector
     # moves. A token-based tunnel would have meant recreating all of that.
+    network_mode: host
     command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
     # Run as the host user that owns the credentials file.
     #
@@ -120,21 +119,6 @@ services:
     depends_on:
       samo-proxy:
         condition: service_healthy
-
-networks:
-  # Pinned, for the same reason samo-server pins its own: Compose otherwise
-  # auto-assigns the next free /16 from Docker's pool, and that drifts as other
-  # stacks come and go. Here the subnet is load-bearing rather than incidental —
-  # SAMOPROXY_TRUST_FORWARDED_FROM names it, and a drifted subnet would silently
-  # stop trusting cloudflared, which shows up as every client sharing one
-  # rate-limit bucket rather than as an error.
-  #
-  # 172.23 rather than samo-server's 172.22, so the two stacks never collide if
-  # they ever land on the same host.
-  default:
-    ipam:
-      config:
-        - subnet: 172.23.0.0/16
 
 volumes:
   transcode-cache:

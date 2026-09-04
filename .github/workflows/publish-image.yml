@@ -58,3 +58,25 @@ jobs:
                       ghcr.io/${{ github.repository }}:latest
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
+
+            # The compose file goes to the same registry as the image, as an OCI
+            # artifact, so the documented install is one command with nothing to
+            # fetch or edit:
+            #
+            #   docker compose -f oci://ghcr.io/bouliehaan/samo-proxy:compose up -d
+            #
+            # --resolve-image-digests pins the reference inside the artifact to
+            # the image built immediately above.
+            - name: Publish the compose artifact
+              run: |
+                  docker compose -f docker-compose.yml publish --yes \
+                      --resolve-image-digests \
+                      "ghcr.io/${{ github.repository }}:compose-${{ steps.version.outputs.value }}"
+                  docker compose -f docker-compose.yml publish --yes \
+                      --resolve-image-digests \
+                      "ghcr.io/${{ github.repository }}:compose"
+
+            - name: Check the published artifact resolves
+              run: |
+                  docker compose -f "oci://ghcr.io/${{ github.repository }}:compose" config >/dev/null
+                  echo "oci://ghcr.io/${{ github.repository }}:compose resolves"

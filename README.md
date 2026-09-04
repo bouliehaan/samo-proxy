@@ -29,30 +29,32 @@ without breaking anything.
 On the edge box — a Linux host with Docker that is **not** behind the VPN.
 
 ```bash
-git clone https://github.com/bouliehaan/samo-proxy.git
-cd samo-proxy
-cp cloudflared/config.yml.example cloudflared/config.yml   # tunnel id + hostnames
-echo 'SAMOPROXY_ORIGIN=http://192.168.1.10:6969' > .env    # your samo-server
-docker compose pull && docker compose up -d
+docker compose -f oci://ghcr.io/bouliehaan/samo-proxy:compose up -d
 ```
 
-That pulls [`ghcr.io/bouliehaan/samo-proxy:latest`](https://github.com/bouliehaan/samo-proxy/pkgs/container/samo-proxy)
-alongside `cloudflare/cloudflared`. The tunnel's credentials JSON goes in
-`cloudflared/` and is gitignored — it is deployment identity, not source.
+It finds samo-server on the LAN by itself, the same way the Android and desktop
+clients do, so there is no address to set. If your server is somewhere a
+broadcast cannot describe, say so on the same line:
 
-Moving an existing Cloudflare tunnel onto this box rather than making a new one
-is [docs/DEPLOY.md](docs/DEPLOY.md), along with the two checks worth doing
-first: that the box's default route is not itself a VPN, and that it can reach
-samo-server.
+```bash
+SAMOPROXY_ORIGIN=http://192.168.1.10:6969 docker compose -f oci://ghcr.io/bouliehaan/samo-proxy:compose up -d
+```
 
-Nothing is published to the LAN. cloudflared reaches samo-proxy over the compose
-network, and that is deliberate — see [Trust](#trust).
+The tunnel is the one thing that needs a file, because a tunnel id and its
+credentials are deployment identity rather than configuration — put
+`config.yml` and the credentials JSON in `./cloudflared/` before bringing it up.
+Moving an existing tunnel across without recreating it is
+[docs/DEPLOY.md](docs/DEPLOY.md).
+
+Both containers run with host networking: samo-proxy binds `127.0.0.1:6767`,
+cloudflared reaches it there, and nothing on the LAN can reach it at all. That
+is also what lets it broadcast for samo-server — a container on Docker's default
+bridge cannot.
 
 Running it without Docker:
 
 ```bash
-SAMOPROXY_ORIGIN=http://192.168.1.10:6969 SAMOPROXY_CACHE_DIR=./cache \
-  go run ./cmd/samo-proxy
+go run ./cmd/samo-proxy
 ```
 
 `ffmpeg` is a hard runtime dependency; it is the whole reason this is a Go
@@ -65,8 +67,8 @@ Every default is correct for the topology above. In practice only
 
 | Variable | Default | Notes |
 |---|---|---|
-| `SAMOPROXY_ADDR` | `127.0.0.1:6767` | Compose overrides to the container network |
-| `SAMOPROXY_ORIGIN` | `http://192.168.1.10:6969` | samo-server on the LAN |
+| `SAMOPROXY_ADDR` | `127.0.0.1:6767` | Loopback, so only cloudflared on the same host can reach it |
+| `SAMOPROXY_ORIGIN` | *(discovered)* | samo-server on the LAN. Found by UDP broadcast when unset; set it only for a server a broadcast cannot reach |
 | `SAMOPROXY_FORWARDED_PROTO` | `https` | What to tell samo-server the client's scheme was |
 | `SAMOPROXY_TRUST_FORWARDED_FROM` | `127.0.0.0/8,::1/128` | Whose `CF-Connecting-IP` to believe |
 | `SAMOPROXY_TRANSCODE` | `true` | |
@@ -81,7 +83,6 @@ Every default is correct for the topology above. In practice only
 | `SAMOPROXY_EGRESS_TOKEN` | *(unset)* | Shared secret. **Setting it is what turns egress on.** |
 | `SAMOPROXY_EGRESS_ADDR` | `0.0.0.0:6768` when a token is set | Egress listener |
 | `SAMOPROXY_EGRESS_ALLOW_HOSTS` | Deezer image CDN only | Closed list; exact host or `.suffix` |
-| `SAMOPROXY_EGRESS_PORT` | `127.0.0.1:6768` | Host side of the published port |
 | `SAMOPROXY_LOG_LEVEL` | `info` | |
 
 Responses carry `X-Samo-Proxy-Transcode` (`opus@128k` or `passthrough`) and
@@ -98,10 +99,13 @@ trustworthy — **but only because it came from cloudflared**. Anything else tha
 can reach this port gets to pick its own rate-limit bucket, and an attacker with
 an unlimited supply of buckets has defeated the per-IP lockout.
 
-So the compose file publishes no ports, and the trusted CIDR is the pinned
-compose subnet (`172.23.0.0/16`) — pinned rather than left to Docker's pool
-because a drifted subnet would silently stop trusting cloudflared, which surfaces
-as every client sharing one bucket rather than as an error.
+So samo-proxy binds loopback and trusts loopback. cloudflared is on the same host
+stack and reaches it there; nothing on the LAN can reach it at all.
+
+That is tighter than what this used to do, which was trust a pinned compose
+subnet — every container on the host, and one that silently stopped trusting
+cloudflared if Docker's address pool drifted. It surfaced as every client sharing
+one rate-limit bucket rather than as an error.
 
 ## Letting the samo box out, narrowly
 
