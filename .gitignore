@@ -17,3 +17,8 @@ cloudflared/*.json
 # Your own tunnel config: the tunnel id and hostnames are deployment identity,
 # not source. Copy cloudflared/config.yml.example and fill it in.
 cloudflared/config.yml
+
+# Maintainer tooling: deploy.sh ships a worktree to my dev boxes, commit.sh is
+# the gate before anything goes public. They live on my machine, not in the
+# repo — nobody cloning this can use them.
+*.sh
